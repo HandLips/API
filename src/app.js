@@ -278,8 +278,17 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start server
-const PORT = process.env.PORT || 3000;
+// Start
+const PORT = process.env.PORT || 2004;
 app.listen(PORT, () => {
   console.log(`Server berjalan di port ${PORT}`);
+  console.log(`Test API at: http://localhost:${PORT}`);
+  console.log("\nAvailable routes:");
+  console.log("- GET    /test");
+  console.log("- GET    /api/history");
+  console.log("- POST   /api/history");
+  console.log("- GET    /api/history/:id");
+  console.log("- GET    /api/profile");
+  console.log("- PUT    /api/profile");
+  console.log("- POST   /api/feedback");
 });
