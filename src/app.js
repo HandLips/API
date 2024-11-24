@@ -1,11 +1,12 @@
-// Import dependencies
 require("dotenv").config();
 const express = require("express");
-const mysql = require("mysql2/promise");
-const multer = require("multer");
-const path = require("path");
-const cors = require("cors");
+const { Sequelize, DataTypes } = require("sequelize");
+const textToSpeech = require("@google-cloud/text-to-speech");
 const { Storage } = require("@google-cloud/storage");
+const path = require("path");
+const { v4: uuidv4 } = require("uuid");
+const multer = require("multer");
+const cors = require("cors");
 
 // Initialize express app
 const app = express();
@@ -15,22 +16,56 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Database configuration
-const dbConfig = {
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-};
+// Database setup with Sequelize
+const sequelize = new Sequelize(
+  process.env.DB_NAME,
+  process.env.DB_USER,
+  process.env.DB_PASSWORD,
+  {
+    host: process.env.DB_HOST,
+    dialect: "mysql",
+    logging: false,
+    pool: {
+      max: 10,
+      min: 0,
+      acquire: 30000,
+      idle: 10000,
+    },
+  }
+);
 
-// Cloud Storage setup
-const storage = new Storage({
-  projectId: process.env.PROJECT_ID,
+// Model definitions
+const Soundboard = sequelize.define("Soundboard", {
+  id: {
+    type: DataTypes.UUID,
+    defaultValue: DataTypes.UUIDV4,
+    primaryKey: true,
+  },
+  text: {
+    type: DataTypes.TEXT,
+    allowNull: false,
+  },
+  audioUrl: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  fileName: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
 });
-const bucket = storage.bucket(process.env.BUCKET_NAME);
+
+// Google Cloud Setup
+const storage = new Storage({
+  keyFilename: path.join(__dirname, "gcp-key.json"),
+  projectId: process.env.GCP_PROJECT_ID,
+});
+
+const bucket = storage.bucket(process.env.GCP_BUCKET_NAME);
+
+const ttsClient = new textToSpeech.TextToSpeechClient({
+  keyFilename: path.join(__dirname, "gcp-key.json"),
+});
 
 // Multer configuration for file uploads
 const upload = multer({
@@ -48,43 +83,102 @@ const upload = multer({
   },
 });
 
-// Database connection pool
-const pool = mysql.createPool(dbConfig);
-
-// Helper function to handle database queries
-async function query(sql, params) {
-  const connection = await pool.getConnection();
+// Helper Functions
+const generateSpeech = async (text) => {
   try {
-    const [results] = await connection.execute(sql, params);
-    return results;
-  } finally {
-    connection.release();
+    const request = {
+      input: { text },
+      voice: { languageCode: "id-ID", ssmlGender: "NEUTRAL" },
+      audioConfig: { audioEncoding: "MP3" },
+    };
+
+    const [response] = await ttsClient.synthesizeSpeech(request);
+    return response.audioContent;
+  } catch (error) {
+    throw new Error(`Error generating speech: ${error.message}`);
   }
-}
+};
 
-// Helper function for file upload to Google Cloud Storage
-async function uploadFile(file) {
-  const blob = bucket.file(`profiles/${Date.now()}-${file.originalname}`);
-  const blobStream = blob.createWriteStream({
-    resumable: false,
-    metadata: {
-      contentType: file.mimetype,
-    },
-  });
+const uploadToGCS = async (buffer, filename, contentType = "audio/mpeg") => {
+  const file = bucket.file(filename);
 
-  return new Promise((resolve, reject) => {
-    blobStream.on("error", (err) => reject(err));
-    blobStream.on("finish", () => {
-      const publicUrl = `https://storage.googleapis.com/${bucket.name}/${blob.name}`;
-      resolve(publicUrl);
+  try {
+    await file.save(buffer, {
+      contentType: contentType,
+      metadata: {
+        cacheControl: "public, max-age=31536000",
+      },
     });
-    blobStream.end(file.buffer);
-  });
-}
 
-// HISTORY API ENDPOINTS
+    const publicUrl = `https://storage.googleapis.com/${process.env.GCP_BUCKET_NAME}/${filename}`;
+    return publicUrl;
+  } catch (error) {
+    throw new Error(
+      `Error uploading to Google Cloud Storage: ${error.message}`
+    );
+  }
+};
 
-// Create History
+// API ROUTES
+
+// Soundboard Routes
+app.post("/api/soundboards", async (req, res) => {
+  try {
+    const { text } = req.body;
+
+    if (!text) {
+      return res.status(400).json({ error: "Text is required" });
+    }
+
+    console.log("Generating speech for text:", text);
+    const audioBuffer = await generateSpeech(text);
+
+    const fileName = `${uuidv4()}.mp3`;
+    console.log("Uploading to Cloud Storage with filename:", fileName);
+    const audioUrl = await uploadToGCS(audioBuffer, fileName);
+
+    console.log("Creating database entry");
+    const soundboard = await Soundboard.create({
+      text,
+      audioUrl,
+      fileName,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Soundboard created successfully",
+      data: soundboard,
+    });
+  } catch (error) {
+    console.error("Error creating soundboard:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to create soundboard",
+    });
+  }
+});
+
+app.get("/api/soundboards", async (req, res) => {
+  try {
+    const soundboards = await Soundboard.findAll({
+      order: [["createdAt", "DESC"]],
+    });
+
+    res.json({
+      success: true,
+      message: "Soundboards retrieved successfully",
+      data: soundboards,
+    });
+  } catch (error) {
+    console.error("Error fetching soundboards:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch soundboards",
+    });
+  }
+});
+
+// History Routes
 app.post("/api/history", async (req, res) => {
   try {
     const { title, message } = req.body;
@@ -96,15 +190,18 @@ app.post("/api/history", async (req, res) => {
       });
     }
 
-    const result = await query(
+    const [result] = await sequelize.query(
       "INSERT INTO history (title, message) VALUES (?, ?)",
-      [title, message]
+      {
+        replacements: [title, message],
+        type: Sequelize.QueryTypes.INSERT,
+      }
     );
 
     res.status(201).json({
       success: true,
       data: {
-        id: result.insertId,
+        id: result,
         title,
         message,
       },
@@ -117,11 +214,11 @@ app.post("/api/history", async (req, res) => {
   }
 });
 
-// Get All History
 app.get("/api/history", async (req, res) => {
   try {
-    const histories = await query(
-      "SELECT * FROM history ORDER BY created_at DESC"
+    const [histories] = await sequelize.query(
+      "SELECT * FROM history ORDER BY created_at DESC",
+      { type: Sequelize.QueryTypes.SELECT }
     );
 
     res.json({
@@ -136,12 +233,15 @@ app.get("/api/history", async (req, res) => {
   }
 });
 
-// Get History Detail
 app.get("/api/history/:id", async (req, res) => {
   try {
-    const [history] = await query("SELECT * FROM history WHERE id = ?", [
-      req.params.id,
-    ]);
+    const [history] = await sequelize.query(
+      "SELECT * FROM history WHERE id = ?",
+      {
+        replacements: [req.params.id],
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
 
     if (!history) {
       return res.status(404).json({
@@ -162,12 +262,12 @@ app.get("/api/history/:id", async (req, res) => {
   }
 });
 
-// PROFILE API ENDPOINTS
-
-// Get Profile
+// Profile Routes
 app.get("/api/profile", async (req, res) => {
   try {
-    const [profile] = await query("SELECT * FROM profile LIMIT 1");
+    const [profile] = await sequelize.query("SELECT * FROM profile LIMIT 1", {
+      type: Sequelize.QueryTypes.SELECT,
+    });
 
     if (!profile) {
       return res.status(404).json({
@@ -188,7 +288,6 @@ app.get("/api/profile", async (req, res) => {
   }
 });
 
-// Update Profile
 app.put("/api/profile", upload.single("profile_picture"), async (req, res) => {
   try {
     const { name } = req.body;
@@ -202,7 +301,12 @@ app.put("/api/profile", upload.single("profile_picture"), async (req, res) => {
     }
 
     if (req.file) {
-      profilePictureUrl = await uploadFile(req.file);
+      const filename = `profiles/${Date.now()}-${req.file.originalname}`;
+      profilePictureUrl = await uploadToGCS(
+        req.file.buffer,
+        filename,
+        req.file.mimetype
+      );
     }
 
     const updateQuery = profilePictureUrl
@@ -211,7 +315,10 @@ app.put("/api/profile", upload.single("profile_picture"), async (req, res) => {
 
     const params = profilePictureUrl ? [name, profilePictureUrl] : [name];
 
-    await query(updateQuery, params);
+    await sequelize.query(updateQuery, {
+      replacements: params,
+      type: Sequelize.QueryTypes.UPDATE,
+    });
 
     res.json({
       success: true,
@@ -228,9 +335,7 @@ app.put("/api/profile", upload.single("profile_picture"), async (req, res) => {
   }
 });
 
-// FEEDBACK API ENDPOINTS
-
-// Create Feedback
+// Feedback Routes
 app.post("/api/feedback", async (req, res) => {
   try {
     const { comment, rating } = req.body;
@@ -249,15 +354,18 @@ app.post("/api/feedback", async (req, res) => {
       });
     }
 
-    const result = await query(
+    const [result] = await sequelize.query(
       "INSERT INTO feedback (comment, rating) VALUES (?, ?)",
-      [comment, rating]
+      {
+        replacements: [comment, rating],
+        type: Sequelize.QueryTypes.INSERT,
+      }
     );
 
     res.status(201).json({
       success: true,
       data: {
-        id: result.insertId,
+        id: result,
         comment,
         rating,
       },
@@ -272,23 +380,40 @@ app.post("/api/feedback", async (req, res) => {
 
 // Error handling middleware
 app.use((err, req, res, next) => {
+  console.error(err.stack);
   res.status(500).json({
     success: false,
     message: err.message,
   });
 });
 
-// Start
-const PORT = process.env.PORT || 2004;
-app.listen(PORT, () => {
-  console.log(`Server berjalan di port ${PORT}`);
-  console.log(`Test API at: http://localhost:${PORT}`);
-  console.log("\nAvailable routes:");
-  console.log("- GET    /test");
-  console.log("- GET    /api/history");
-  console.log("- POST   /api/history");
-  console.log("- GET    /api/history/:id");
-  console.log("- GET    /api/profile");
-  console.log("- PUT    /api/profile");
-  console.log("- POST   /api/feedback");
-});
+// Server & Database Initialization
+const PORT = process.env.PORT || 3000;
+
+const start = async () => {
+  try {
+    // Sync database
+    await sequelize.sync();
+    console.log("Database synced successfully");
+
+    // Start server
+    app.listen(PORT, () => {
+      console.log(`Server berjalan di port ${PORT}`);
+      console.log(`Test API at: http://localhost:${PORT}`);
+      console.log("\nAvailable routes:");
+      console.log("- POST   /api/soundboards");
+      console.log("- GET    /api/soundboards");
+      console.log("- POST   /api/history");
+      console.log("- GET    /api/history");
+      console.log("- GET    /api/history/:id");
+      console.log("- GET    /api/profile");
+      console.log("- PUT    /api/profile");
+      console.log("- POST   /api/feedback");
+    });
+  } catch (error) {
+    console.error("Unable to start server:", error);
+    process.exit(1);
+  }
+};
+
+start();
